@@ -243,7 +243,7 @@ class ImageUtilities:
 
         # Put the cutout image in the FITS HDU
         output_hdu = fits.ImageHDU(cutout.data)
-        output_hdu.header = header
+        output_hdu.header = header.copy()
 
         # Update the FITS header with the cutout WCS
         output_hdu.header.update(cutout.wcs.to_header())
@@ -614,11 +614,13 @@ class Outflow:
         """
 
         # Perform an initial crop before rotating
+        diagonal_arcsec = np.hypot(self.window_x_arcsec, self.window_y_arcsec)
+        precrop_size_arcsec = diagonal_arcsec * 1.2
         hdu_cut_initial = ImageUtilities.cutout(
             image_hdu,
             self.central_coord,
-            self.window_x_arcsec*2,
-            self.window_y_arcsec*2,
+            precrop_size_arcsec,
+            precrop_size_arcsec,
         )
 
         # Rotate the image
@@ -680,10 +682,9 @@ class Outflow:
             # Mask out any structures with NaNs or a maximum value > 1000 x the noise
             mask = np.zeros(np.shape(data))
             for structure in dend.leaves:
-                # y_idx, x_idx = structure.indices(subtree=True)  # matches get_mask()'s default subtree behavior
-                # ymin, ymax = y_idx.min(), y_idx.max()
-                # xmin, xmax = x_idx.min(), x_idx.max()
-                structrure_mask = data * structure.get_mask()
+
+                #structrure_mask = data * structure.get_mask()
+
                 remove_src = (
                     np.any(np.isnan(structure.values()))
                     or structure.vmax >= 1000 * noise
@@ -727,6 +728,38 @@ class Outflow:
             }
             structure_data.append(data)
         return structure_data
+
+    @staticmethod
+    def _cropped_structure_mask(structure, shape, pad=1):
+        """ Builds a cropped mask based on the structure's bounding box, instead
+        of creating a mask the size of the entire image (speeds up contour plotting)
+
+        Args:
+            structure (astrodendro structure): Structure to build the mask for
+            shape (tuple): Shape (ny, nx) of the full image the structure is in
+            pad (int, optional): Padding (in pixels) around the structure's bounding
+                box. At least 1 px of padding is needed so the contour ends at the
+                edge of the crop. Defaults to 1.
+
+        Returns:
+            cropped_mask (np.ndarray): Local mask array, cropped to the padded
+                bounding box.
+            x0, y0 (int): Pixel offset of the cropped mask's origin within the full
+                image (i.e. cropped_mask[0, 0] corresponds to full-image pixel
+                (y0, x0)).
+        """
+        y_idx, x_idx = structure.indices(subtree=True)
+        ny, nx = shape
+
+        y0 = max(int(y_idx.min()) - pad, 0)
+        y1 = min(int(y_idx.max()) + pad + 1, ny)
+        x0 = max(int(x_idx.min()) - pad, 0)
+        x1 = min(int(x_idx.max()) + pad + 1, nx)
+
+        cropped_mask = np.zeros((y1 - y0, x1 - x0), dtype=int)
+        cropped_mask[y_idx - y0, x_idx - x0] = 1
+
+        return cropped_mask, x0, y0
 
     def select_structures(
         self,
@@ -806,10 +839,17 @@ class Outflow:
                     leaf_condition = False
 
                 if hasattr(structure, "get_mask") and not leaf_condition:
-                    # Plot the contour
-                    mask = structure.get_mask().astype(int)
+                    # Plot the contour using a cropped mask
+                    mask, x0, y0 = self._cropped_structure_mask(
+                        structure, self.window_hdu.data.shape
+                    )
                     contour_set = ax.contour(
-                        mask, levels=[0.5], colors=["white"], alpha=0.9, linewidths=1
+                        mask,
+                        levels=[0.5],
+                        colors=["white"],
+                        alpha=0.9,
+                        linewidths=1,
+                        extent=(x0, x0 + mask.shape[1] - 1, y0, y0 + mask.shape[0] - 1),
                     )
                     # Store the contour paths for click detection
                     structure_contours[structure.idx] = {
@@ -817,6 +857,7 @@ class Outflow:
                         "contour_set": contour_set,
                         "paths": [],
                         "mask": mask,
+                        "origin": (x0, y0),
                     }
 
                     # Extract paths from contour collections
@@ -855,7 +896,7 @@ class Outflow:
                         update_display()
 
         def find_clicked_structure(point):
-            """Find which structure was clicked based on contour paths or mask."""
+            """Finds which structure was clicked based on contour paths or mask"""
             x, y = point
 
             for struct_id, contour_data in structure_contours.items():
@@ -870,11 +911,13 @@ class Outflow:
                         except (AttributeError, TypeError):
                             continue
 
-                # Fallback to mask-based detection
+                # Fallback to mask-based detection (mask is cropped to the
+                # structure's bounding box, so offset the click by its origin)
                 mask = contour_data["mask"]
+                x0, y0 = contour_data["origin"]
                 try:
-                    # Convert coordinates to integer indices
-                    ix, iy = int(round(x)), int(round(y))
+                    # Convert coordinates to integer indices local to the crop
+                    ix, iy = int(round(x)) - x0, int(round(y)) - y0
                     if (
                         0 <= ix < mask.shape[1]
                         and 0 <= iy < mask.shape[0]
@@ -887,14 +930,21 @@ class Outflow:
             return None
 
         def add_structure(structure):
-            """Add structure to selection and highlight it."""
+            """Add structure to selection and highlight it"""
             if structure.idx not in selected_structures:
                 selected_structures.append(structure.idx)
 
-                # Highlight the selected structure
-                mask = structure.get_mask().astype(int)
+                # Reuse the cropped mask already computed in plot_contours
+                contour_data = structure_contours[structure.idx]
+                mask = contour_data["mask"]
+                x0, y0 = contour_data["origin"]
                 highlight_contour = ax.contour(
-                    mask, levels=[0.5], colors=["lime"], alpha=0.9, linewidths=3
+                    mask,
+                    levels=[0.5],
+                    colors=["lime"],
+                    alpha=0.9,
+                    linewidths=3,
+                    extent=(x0, x0 + mask.shape[1] - 1, y0, y0 + mask.shape[0] - 1),
                 )
 
                 structure_patches[structure.idx] = highlight_contour
@@ -1192,7 +1242,7 @@ class Outflow:
                         np.nanmedian(pix_pas_left),
                         np.nanmedian(pix_pas_right),
                     ]
-                    print(fit_positions)
+                    #print(fit_positions)
 
                 initial_guess = [
                     1,
@@ -1202,7 +1252,7 @@ class Outflow:
                     fit_positions[1],
                     np.nanstd(pix_pas_right),
                 ]
-                print(initial_guess)
+                #print(initial_guess)
 
                 popt, pcov = curve_fit(
                     bimodal, bin_centers, counts, p0=initial_guess, bounds=([0, 180])
@@ -1277,19 +1327,8 @@ class Outflow:
                 self._position_angle_err = std_fit
                 return mean_fit, std_fit, x_fit, y_fit, pix_pas
             except UnboundLocalError:  # fitting failed
-                # Estimate outflow PA from the PAs of all outflow pixels.
-                # Treats angles as axial (0 == 180).
-                # Double the angles to map axial data onto a full circle,
-                # take the vector mean, then halve
-                pixel_pas_deg = np.array(
-                    [
-                        coord.position_angle(outflow_coord).to(u.deg).value
-                        for coord in pix_coords
-                    ]
-                )
-                mean_pa = np.mean(pixel_pas_deg)
+                mean_pa = np.mean(pix_pas)
                 self._position_angle = mean_pa
-                # self._position_angle = None
                 self._position_angle_err = None
                 print("Fit failed. Average pixel PA calculated instead.")
                 return None
@@ -1417,8 +1456,6 @@ class Outflow:
         wcs = WCS(hdu.header)
         central_pix_coord = wcs.world_to_pixel(self.central_coord)
 
-        image_pa = hdu.header["PA_APER"]
-
         if not self.selected_structures and not self._position_angle:
             raise ValueError(
                 "No position angle stored. Run select_structures() and compute_PA() first."
@@ -1428,13 +1465,24 @@ class Outflow:
             raise ValueError("No position angle stored. Run compute_PA() first.")
             return None
 
-        rotation_angle = self._position_angle - image_pa - 90
+        # Get the arrow direction from the hdu's WCS (PA_APER isn't updated when
+        # the image is rotated, so it's wrong for the rotated outflow window)
+        offset_coord = self.central_coord.directional_offset_by(
+            self._position_angle * u.deg, 1 * u.arcsec
+        )
+        offset_pix_coord = wcs.world_to_pixel(offset_coord)
+        rotation_angle = np.degrees(
+            np.arctan2(
+                offset_pix_coord[1] - central_pix_coord[1],
+                offset_pix_coord[0] - central_pix_coord[0],
+            )
+        )
         pixel_scale = ImageUtilities.get_pixel_scale(hdu)
 
         # # Find the max and min x values in the selected structures and set the arrow length to their difference
         masked_inds = np.where(self._selected_structure_mask == 1)
         length = np.max(masked_inds[1]) - np.min(masked_inds[1])
-        print(length)
+        #(length)
         # length = self.window_x_arcsec / pixel_scale
         # Set the height to the window height
         height = self.window_y_arcsec / pixel_scale
